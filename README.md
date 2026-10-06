@@ -608,6 +608,7 @@ http://127.0.0.1:7863/panel/
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/responses` | Bearer（`api_key` 非空时） | OpenAI Responses API（Codex 等只认 `wire_api = "responses"` 的客户端）；流式/非流式，与 chat 端点共用同一套挑号/粘性/冷却/记账逻辑；请求体在网关内翻译为 chat 后转发（见「Codex 接入」） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -623,6 +624,36 @@ http://127.0.0.1:7863/panel/
 响应同时带 `X-Service: workbuddy2api` 头。这两个身份标识用于区分**本网关**与同端口上可能残留的其他服务——对方即使返回 2xx 也不会带该字段 / 头，宿主探测据此避免"假成功"。
 
 **宿主健康探测指引**：强校验（推荐）用 `/status` + `api_key`——只有持有正确 `api_key` 的本网关返回 200，其他服务返回 401 / 404；弱校验（不适合持 key 的负载均衡器）用 `/healthz` + `service` 字段判据（`/healthz` 恒无鉴权，`service == "workbuddy2api"` 才算命中本网关）。容器自带 `HEALTHCHECK` 用的就是弱校验（仅进程内自检，够用）。
+
+### Codex 接入（Responses API）
+
+Codex 0.160.0 起**移除了 `wire_api = "chat"`**（配置会直接报
+`` `wire_api = "chat"` is no longer supported ``），只认 `wire_api = "responses"`，
+因此网关提供 `POST /v1/responses`——客户端请求在网关内翻译成 chat 请求体后走既有
+上游链路，应答再翻译回 Responses 事件序列（`response.created` → 推理/正文/工具调用项
+事件 → `response.completed` → `data: [DONE]`）。
+
+`~/.codex/config.toml`：
+
+```toml
+model = "deepseek-v4.1-flash"        # 换成 /v1/models 里可用的模型
+model_provider = "workbuddy"
+
+[model_providers.workbuddy]
+name = "workbuddy"
+base_url = "http://127.0.0.1:7863/v1"
+wire_api = "responses"
+env_key = "WORKBUDDY_API_KEY"        # 值 = 网关 api_key
+```
+
+翻译与共用行为：`instructions` → `system` 首条消息，`developer` 角色 → `system`，
+`input[]` 的 message / function_call / function_call_output → chat 的
+messages / assistant.tool_calls / role:"tool"（`call_id` 对齐，供上游配对校验），
+扁平 function 工具 → chat 的嵌套 `{type:"function",function:{...}}`，
+`reasoning.effort` → `reasoning_effort`，`max_output_tokens` → `max_completion_tokens`，
+`prompt_cache_key` 原值保留（喂上游前缀缓存）；`store`/`include`/`client_metadata`
+与非 function 工具（`web_search` 等）丢弃。会话粘性沿用 `prompt_cache_key`
+（见「会话粘性」），因此同一 Codex 会话稳定落在同一账号上。
 
 ### 流式行为细节
 

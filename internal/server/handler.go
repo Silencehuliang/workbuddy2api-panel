@@ -136,6 +136,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// Responses API：Codex 0.160.0 起只认 wire_api="responses"，网关不提供该端点时
+	// 请求落到默认 mux 的 404（见 responses.go 文件头）。
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -146,8 +149,8 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
-		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && isCompletionPath(r.URL.Path) {
+		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
 		}
@@ -503,6 +506,23 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	h.completions(w, r, chatFE{})
+}
+
+// responses Responses API 入口（Codex 等只认 /v1/responses 的客户端）。
+func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
+	h.completions(w, r, responsesFE{})
+}
+
+// isCompletionPath 报告路径是否为「补全类」端点（请求日志/观测的挂载判据）。
+func isCompletionPath(p string) bool {
+	return p == "/v1/chat/completions" || p == "/v1/responses"
+}
+
+// completions 协议无关的补全核心：翻译 → 选号轮转 → 上游调用 → 错误/账号处置 → 出帧。
+// fe 决定客户端协议（chat / responses，见 frontend.go）；除三个协议钩子外，两个前端
+// 共用全部调度与观测逻辑（挑号、粘性、冷却/熔断、用量与积分记账、请求日志）。
+func (h *Handler) completions(w http.ResponseWriter, r *http.Request, fe frontend) {
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
 	clientIP := upstream.ExtractClientIP(r)
@@ -510,9 +530,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 上游自然返回错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断
 	// 防御语义保留在读错误路径——移除预拦截后，截断只可能来自客户端自己断流，
 	// 读 body 出错就地 400，不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
-	body, err := io.ReadAll(r.Body)
+	rawBody, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		return
+	}
+	// 入站协议翻译（chat 前端恒等；responses 转成 chat 请求体）。翻译失败是请求
+	// 形态问题、与账号无关：400 直回，不进轮转（换号必然同样失败）。
+	body, err := fe.translate(rawBody)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	var peek struct {
@@ -549,7 +576,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
-	sessKey := session.ExtractKey(body)
+	// 取**入站原文**而非翻译后 body：responses 的会话键在 prompt_cache_key 上，
+	// 该字段是网关侧路由协议、不进 chat 出站体（chat 请求两者恒等，行为不变）。
+	sessKey := session.ExtractKey(rawBody)
 	stickyUID := ""
 	if h.cfg.Session != nil && sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
@@ -951,10 +980,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// hint 字段（hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才
 			// 组装请求上下文做判定）。
 			// errFrame：上游 error 帧原文（观察者旁路采集），用于流尾的账号处置。
+			// 出帧交给前端：chat 走 SSE 透传，responses 走事件序列翻译（frontend.go）。
 			var errFrame string
-			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
-				return h.hintContext(bareModel, reqHasImage)
-			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }))
+			sErr := fe.stream(w, stats, frontendMeta{
+				Model:     peek.Model,
+				BareModel: bareModel,
+				CreatedAt: st.start,
+				HintFn: upstream.FrameHintFunc(func() upstream.HintContext {
+					return h.hintContext(bareModel, reqHasImage)
+				}),
+			}, upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }))
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
 				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
@@ -1048,7 +1083,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if st.hasCache {
 			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
 		}
-		writeJSON(w, http.StatusOK, resp)
+		// 出帧交给前端：chat 原样返回聚合响应，responses 转成 Responses 响应对象。
+		fe.writeAggregate(w, resp, frontendMeta{
+			Model:     peek.Model,
+			BareModel: bareModel,
+			CreatedAt: st.start,
+		})
 		st.status = http.StatusOK
 		st.outcome = reqlog.OutcomeSuccess
 		st.toks = completionTokens(resp)

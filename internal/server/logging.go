@@ -345,6 +345,10 @@ type requestTrace struct {
 	id    string
 	start time.Time
 	stat  *chatStat
+	// path 入站请求路径（/v1/chat/completions 或 /v1/responses）。归档与面板按它区分
+	// 协议——两个端点共用同一套观测字段，只有路径能说明客户端用的是哪种协议。
+	// 空串回退 /v1/chat/completions（直接构造 trace 的测试与老调用点语义不变）。
+	path string
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
@@ -397,10 +401,14 @@ func requestTraceFrom(r *http.Request) *requestTrace {
 }
 
 func (t *requestTrace) event(status int) reqlog.Event {
+	path := t.path
+	if path == "" {
+		path = "/v1/chat/completions"
+	}
 	e := reqlog.Event{
 		Time:      t.start,
 		RequestID: t.id,
-		Path:      "/v1/chat/completions",
+		Path:      path,
 		Status:    status,
 	}
 	duration := time.Since(t.start)
